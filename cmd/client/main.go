@@ -31,7 +31,7 @@ func main() {
 		waitGroup.Add(1)
 		go func(ew int) {
 			defer waitGroup.Done()
-			if _, err := client.Put("client1", fmt.Sprint(ew), fmt.Sprint(ew)); err != nil {
+			if _, err := client.Get("client1", fmt.Sprint(ew)); err != nil {
 				log.Println(err)
 			}
 		}(j)
@@ -41,7 +41,7 @@ func main() {
 				waitGroup.Add(1)
 				go func() {
 					defer waitGroup.Done()
-					if _, err := client.Put("client1", "5", "5"); err != nil {
+					if _, err := client.Get("client1", "5"); err != nil {
 						log.Println(err)
 					}
 				}()

@@ -93,7 +93,7 @@ func NewKVS() *KVS {
 // an appropriate err value, otherwise err should be set to nil.
 func (d *KVS) Initialize(localTracer *tracing.Tracer, clientId string, frontEndAddr string, chCapacity uint) (NotifyChannel, error) {
 	d.notifyCh = make(chan ResultStruct, chCapacity)
-	client, err := rpc.DialHTTP("tcp", "localhost"+frontEndAddr)
+	client, err := rpc.Dial("tcp", "localhost"+frontEndAddr)
 	if err != nil {
 		log.Fatal("cannot rpc connect to FrontEnd")
 	}

@@ -1,8 +1,8 @@
 package distkvs
 
 import (
+	"container/list"
 	"errors"
-	"fmt"
 	"io/ioutil"
 	"log"
 	"net"
@@ -25,41 +25,44 @@ type StorageConfig struct {
 	TracerSecret     []byte
 }
 
-type StorageLoadSuccess struct {
-	State map[string]string
-}
-
-type StoragePut struct {
-	Key   string
-	Value string
-}
-
-type StorageSaveData struct {
-	Key   string
-	Value string
-}
-
-type StorageGet struct {
-	Key string
-}
-
 type StorageGetResult struct {
-	Key   string
-	Value *string
+	Key      string
+	Value    *string
+	Response bool
+}
+
+type StorageJoined struct {
+	StorageID string
+	State     map[string]string
+}
+
+type StorageStateResponse struct {
+	StorageMap map[string]string
 }
 
 type Storage struct {
 	// state may go here
-	KVStore concurmap.ConcurrentMap
-	mu      sync.Mutex
+	KVStore       concurmap.ConcurrentMap
+	PutQueue      *list.List
+	mu            *sync.Mutex
+	storageClient *rpc.Client
+	joinState     string
 }
 
 var (
 	fileName     string = "KVFile.txt"
 	fullPathFile string
+	wg           sync.WaitGroup
 )
 
-func (s *Storage) Start(frontEndAddr string, storageAddr string, diskPath string, strace *tracing.Tracer) error {
+func NewStorage() *Storage {
+	return &Storage{KVStore: concurmap.New()}
+}
+
+func (s *Storage) Start(storageId string, frontEndAddr string, storageAddr string, diskPath string, strace *tracing.Tracer) error {
+	s.mu = &sync.Mutex{}
+	s.joinState = "unjoined"
+	s.PutQueue = list.New()
 	//check if file in disk exists, create new one if not
 	fullPathFile = diskPath + fileName
 	if _, err := os.Stat(fullPathFile); os.IsNotExist(err) {
@@ -71,22 +74,60 @@ func (s *Storage) Start(frontEndAddr string, storageAddr string, diskPath string
 
 	//update info in disk to storage KVstore
 	s.UpdateFromFile(fullPathFile)
-	//set up RPC handler and register the functions
-	rpc.Register(s)
 
-	listener, rpcErr := net.Listen("tcp", "localhost"+frontEndAddr)
-	if rpcErr != nil {
-		log.Fatal(rpcErr)
+	//set up listener at storage port
+	wg.Add(1)
+	go s.listenOnPort(storageAddr)
+
+	//connect to FrontEnd
+	storageClient, err := ConnectToNode(frontEndAddr)
+	if err != nil {
+		log.Fatal(storageId + " cannot rpc connect to Frontend")
 	}
-	defer listener.Close()
 
-	rpc.Accept(listener)
+	s.storageClient = storageClient
 
+	storageJoinRequest := StorageJoinRequest{StorageId: storageId, StorageAddress: storageAddr}
+	var requestJoinReply StorageJoinReply
+
+	err = s.storageClient.Call("FrontEnd.RequestJoin", storageJoinRequest, &requestJoinReply)
+	if err != nil {
+		log.Fatal(storageId + " cannot connect to FrontEnd")
+	}
+	s.joinState = requestJoinReply.JoinState
+	if s.joinState == "joining" {
+		for sKey, sVal := range requestJoinReply.StorageMap {
+			if sKey != storageId && sVal.JoinState == "joined" {
+				clie, err := ConnectToNode(sVal.StorageAddress)
+				if err == nil {
+					var stateReply StorageStateResponse
+					err = clie.Call("Storage.ProvideState", StorageJoinRequest{}, &stateReply)
+					if err == nil {
+						if s.updateState(stateReply.StorageMap) {
+							s.joinState = "joined"
+							storageUpdatedRequest := StorageUpToDateRequest{StorageId: storageId, StorageAddress: storageAddr, JoinState: s.joinState}
+							var storageJoinedReply StorageUpToDateResponse
+							err = s.storageClient.Call("FrontEnd.NotifyUpToDate", storageUpdatedRequest, &storageJoinedReply)
+							if err != nil {
+								log.Fatal(storageId + " cannot fully join frontend")
+							}
+							clie.Close()
+							break
+						}
+					}
+				}
+				clie.Close()
+			}
+		}
+	}
+	storageClient.Close()
+	wg.Wait()
 	return nil
 }
 
-func NewStorage() *Storage {
-	return &Storage{KVStore: concurmap.New()}
+func (s *Storage) ProvideState(args *StorageJoinRequest, result *StorageStateResponse) error {
+	result.StorageMap = s.generateMapState()
+	return nil
 }
 
 func (s *Storage) UpdateFromFile(kvFile string) {
@@ -127,7 +168,43 @@ func (s *Storage) UpdateFromFile(kvFile string) {
 	}
 }
 
+func ConnectToNode(port string) (*rpc.Client, error) {
+	client, err := rpc.Dial("tcp", "localhost"+port)
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
+func (s *Storage) listenOnPort(storageAddr string) {
+	defer wg.Done()
+
+	//set up RPC handler and register the functions
+	rpc.Register(s)
+	listener, rpcErr := net.Listen("tcp", "localhost"+storageAddr)
+	if rpcErr != nil {
+		log.Fatal(rpcErr)
+	}
+	defer listener.Close()
+
+	rpc.Accept(listener)
+}
+
+func (s *Storage) updateState(updatedState map[string]string) bool {
+	for k, v := range updatedState {
+		if err := s.updateFileAndStore(&FrontEndPut{Key: k, Value: v}); err != nil {
+			return false
+		}
+	}
+
+	s.handleQueueRequest()
+	return true
+}
+
 func (t *Storage) GetStorage(args *FrontEndGet, result *StorageGetResult) error {
+	for t.PutQueue.Len() > 0 {
+
+	}
 	result.Key = args.Key
 	val, ok := t.KVStore.Get(args.Key)
 	if !ok {
@@ -139,14 +216,25 @@ func (t *Storage) GetStorage(args *FrontEndGet, result *StorageGetResult) error 
 }
 
 func (t *Storage) PutStorage(args *FrontEndPut, result *StorageGetResult) error {
-
-	writeKVToFile(fullPathFile, t, args)
-
-	//update in store
-	t.KVStore.Set(args.Key, args.Value)
+	if t.joinState == "joined" {
+		if err := t.updateFileAndStore(args); err != nil {
+			return err
+		}
+		result.Response = true
+	} else {
+		t.PutQueue.PushBack(args)
+		result.Response = false
+	}
 	result.Key = args.Key
 	result.Value = &args.Value
-	fmt.Println(result.Value)
+	return nil
+}
+
+func (t *Storage) updateFileAndStore(kvPair *FrontEndPut) error {
+	if err := writeKVToFile(fullPathFile, t, kvPair); err != nil {
+		return err
+	}
+	t.KVStore.Set(kvPair.Key, kvPair.Value)
 	return nil
 }
 
@@ -166,4 +254,23 @@ func writeKVToFile(KVDiskFile string, storage *Storage, args *FrontEndPut) error
 	}
 
 	return nil
+}
+
+func (s *Storage) handleQueueRequest() {
+	for s.PutQueue.Len() > 0 {
+		frontReq := s.PutQueue.Front()
+		s.PutQueue.Remove(frontReq)
+		request := StorageGetResult(frontReq.Value.(StorageGetResult))
+		if err := s.updateFileAndStore(&FrontEndPut{Key: request.Key, Value: *request.Value}); err != nil {
+			log.Fatal("could not put info from storage queue into file/state")
+		}
+	}
+}
+
+func (s *Storage) generateMapState() map[string]string {
+	newMap := make(map[string]string)
+	for kv := range s.KVStore.IterBuffered() {
+		newMap[kv.Key] = kv.Val.(string)
+	}
+	return newMap
 }

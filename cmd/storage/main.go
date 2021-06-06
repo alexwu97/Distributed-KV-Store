@@ -24,7 +24,7 @@ func main() {
 	})
 
 	storage := distkvs.Storage{KVStore: concurmap.New()}
-	err = storage.Start(config.FrontEndAddr, string(config.StorageAdd), config.DiskPath, tracer)
+	err = storage.Start(config.StorageID, config.FrontEndAddr, string(config.StorageAdd), config.DiskPath, tracer)
 	if err != nil {
 		log.Fatal(err)
 	}
